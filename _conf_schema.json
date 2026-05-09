@@ -1,0 +1,43 @@
+{
+  "default_currency": {
+    "description": "默认显示货币",
+    "type": "string",
+    "default": "CNY",
+    "options": ["CNY", "USD", "HKD"]
+  },
+  "auto_market_watch": {
+    "description": "启用收盘自动盯盘提醒（A股15:00，美股次日04:00）",
+    "type": "bool",
+    "default": false
+  },
+  "daily_report_time": {
+    "description": "每日收盘报告推送时间 (北京时间, HH:MM)",
+    "type": "string",
+    "default": "15:30"
+  },
+  "weekly_report_day": {
+    "description": "周报推送日 (1=周一 ... 7=周日)",
+    "type": "int",
+    "default": 5
+  },
+  "weekly_report_time": {
+    "description": "周报推送时间 (北京时间, HH:MM)",
+    "type": "string",
+    "default": "17:00"
+  },
+  "monthly_report_day": {
+    "description": "月报推送日 (每月第几天, 1-28)",
+    "type": "int",
+    "default": 1
+  },
+  "risk_warning_threshold": {
+    "description": "单标的集中度风险预警阈值 (%)",
+    "type": "float",
+    "default": 30.0
+  },
+  "target_session": {
+    "description": "定时推送目标会话 (统一消息来源, 如 aiocqhttp:group:123456)",
+    "type": "string",
+    "default": ""
+  }
+}
