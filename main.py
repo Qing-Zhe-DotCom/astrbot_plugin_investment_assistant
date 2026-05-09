@@ -320,7 +320,6 @@ class InvestmentAssistant(Star):
         parts = text.split()
 
         if len(parts) > 1:
-            # Watch specific symbol
             symbol = parts[1]
             market = parts[2] if len(parts) > 2 else "A股"
             quote = await self.mdp.get_quote(symbol, market)
@@ -340,17 +339,16 @@ class InvestmentAssistant(Star):
             else:
                 yield event.plain_result(f"❌ 获取 {symbol}({market}) 行情失败。")
         else:
-            # Watch full portfolio
             positions = self.pm.list_all()
             if not positions:
                 yield event.plain_result("📭 组合为空。用法: `/market_watch <代码> [市场]`")
                 return
 
             yield event.plain_result("⏳ 正在获取行情...")
-            enriched = await self.mdp.get_batch(positions)
-
-            # Also get indices
-            indices = await self.mdp.get_indices()
+            enriched, indices = await asyncio.gather(
+                self.mdp.get_batch(positions),
+                self.mdp.get_indices(),
+            )
 
             lines = ["## 📈 实时盯盘", ""]
             if indices:
@@ -387,9 +385,11 @@ class InvestmentAssistant(Star):
 
         yield event.plain_result("⏳ 正在生成报告...")
 
-        enriched = await self.mdp.get_batch(positions)
+        enriched, indices = await asyncio.gather(
+            self.mdp.get_batch(positions),
+            self.mdp.get_indices(),
+        )
         analysis = self.analyzer.analyze(enriched)
-        indices = await self.mdp.get_indices()
 
         if report_type == "daily":
             report = self.reporter.daily_report(positions, analysis, indices)
@@ -489,9 +489,11 @@ class InvestmentAssistant(Star):
 
         yield event.plain_result("⏳ 正在计算基准对比...")
 
-        enriched = await self.mdp.get_batch(positions)
+        enriched, indices = await asyncio.gather(
+            self.mdp.get_batch(positions),
+            self.mdp.get_indices(),
+        )
         analysis = self.analyzer.analyze(enriched)
-        indices = await self.mdp.get_indices()
 
         lines = ["## 📊 基准对比分析", ""]
 
@@ -1010,12 +1012,13 @@ class InvestmentAssistant(Star):
                     continue
 
                 if self.alert_mgr.check_condition(alert, current_price):
-                    self.alert_mgr.mark_triggered(alert["id"])
+                    self.alert_mgr.mark_triggered(alert["id"], save=False)
                     triggered_any.append((alert, current_price))
             except Exception:
                 continue
 
         if triggered_any:
+            self.alert_mgr._save()
             lines = ["🔔 **价格预警触发**\n"]
             for alert, price in triggered_any:
                 lines.append(
@@ -1031,9 +1034,11 @@ class InvestmentAssistant(Star):
         if not positions:
             return
 
-        enriched = await self.mdp.get_batch(positions)
+        enriched, indices = await asyncio.gather(
+            self.mdp.get_batch(positions),
+            self.mdp.get_indices(),
+        )
         analysis = self.analyzer.analyze(enriched)
-        indices = await self.mdp.get_indices()
 
         total_value = analysis.get("total_value", 0)
         if total_value <= 0:
@@ -1124,7 +1129,6 @@ class InvestmentAssistant(Star):
         )
 
         # Alert check every 5 minutes — needs target_session to notify
-        target_session = self.config.get("target_session", "")
         if target_session:
             await cron.add_basic_job(
                 name="investment_alert_check",
@@ -1138,7 +1142,7 @@ class InvestmentAssistant(Star):
 
         logger.info("投资助手定时任务已注册 (NAV快照 + 预警检查)")
 
-    async def _send_daily_report_to_session(self) -> None:
+    async def _send_report_to_session(self, report_type: str) -> None:
         target = self.config.get("target_session", "")
         if not target:
             return
@@ -1147,35 +1151,27 @@ class InvestmentAssistant(Star):
             return
         enriched = await self.mdp.get_batch(positions)
         analysis = self.analyzer.analyze(enriched)
-        indices = await self.mdp.get_indices()
-        report = self.reporter.daily_report(positions, analysis, indices)
+
+        if report_type == "daily":
+            indices = await self.mdp.get_indices()
+            report = self.reporter.daily_report(positions, analysis, indices)
+        elif report_type == "weekly":
+            end = datetime.now()
+            start = end - timedelta(days=7)
+            report = self.reporter.weekly_report(analysis, start.strftime("%m-%d"), end.strftime("%m-%d"))
+        elif report_type == "monthly":
+            report = self.reporter.monthly_report(analysis, datetime.now().strftime("%Y年%m月"))
+        else:
+            return
+
         chain = MessageChain().message(report)
         await self.context.send_message(target, chain)
+
+    async def _send_daily_report_to_session(self) -> None:
+        await self._send_report_to_session("daily")
 
     async def _send_weekly_report_to_session(self) -> None:
-        target = self.config.get("target_session", "")
-        if not target:
-            return
-        positions = self.pm.list_all()
-        if not positions:
-            return
-        enriched = await self.mdp.get_batch(positions)
-        analysis = self.analyzer.analyze(enriched)
-        end = datetime.now()
-        start = end - timedelta(days=7)
-        report = self.reporter.weekly_report(analysis, start.strftime("%m-%d"), end.strftime("%m-%d"))
-        chain = MessageChain().message(report)
-        await self.context.send_message(target, chain)
+        await self._send_report_to_session("weekly")
 
     async def _send_monthly_report_to_session(self) -> None:
-        target = self.config.get("target_session", "")
-        if not target:
-            return
-        positions = self.pm.list_all()
-        if not positions:
-            return
-        enriched = await self.mdp.get_batch(positions)
-        analysis = self.analyzer.analyze(enriched)
-        report = self.reporter.monthly_report(analysis, datetime.now().strftime("%Y年%m月"))
-        chain = MessageChain().message(report)
-        await self.context.send_message(target, chain)
+        await self._send_report_to_session("monthly")

@@ -6,6 +6,8 @@ from typing import Any
 
 
 class WatchlistManager:
+    VALID_MARKETS = ("A股", "美股", "港股", "虚拟币", "大宗货物")
+
     def __init__(self, data_dir: Path) -> None:
         self._file = data_dir / "watchlist.json"
         self._items: list[dict[str, Any]] = []
@@ -32,8 +34,7 @@ class WatchlistManager:
         market: str,
         notes: str = "",
     ) -> dict[str, Any]:
-        VALID_MARKETS = ("A股", "美股", "港股", "虚拟币", "大宗货物")
-        if market not in VALID_MARKETS:
+        if market not in self.VALID_MARKETS:
             raise ValueError(f"不支持的市场: {market}")
 
         existing = [i for i in self._items if i["symbol"] == symbol.strip().upper() and i["market"] == market]

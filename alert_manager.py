@@ -69,12 +69,13 @@ class AlertManager:
     def list_active(self) -> list[dict[str, Any]]:
         return [a for a in self._alerts if not a["triggered"]]
 
-    def mark_triggered(self, alert_id: str) -> None:
+    def mark_triggered(self, alert_id: str, save: bool = True) -> None:
         for a in self._alerts:
             if a["id"] == alert_id:
                 a["triggered"] = True
                 a["triggered_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                self._save()
+                if save:
+                    self._save()
                 return
 
     def count(self) -> int:
