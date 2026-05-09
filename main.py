@@ -8,7 +8,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import AstrBotConfig, logger
 
 from .portfolio_manager import PortfolioManager
-from .market_data import MarketDataProvider
+from .market_data import AssetResolver, MarketDataProvider
 from .analysis import PortfolioAnalyzer
 from .report_generator import ReportGenerator
 
@@ -23,6 +23,7 @@ class InvestmentAssistant(Star):
         data_dir = StarTools.get_data_dir()
         self.pm = PortfolioManager(data_dir)
         self.mdp = MarketDataProvider()
+        self.resolver = AssetResolver()
         risk_threshold = float(config.get("risk_warning_threshold", 30.0))
         self.analyzer = PortfolioAnalyzer(risk_threshold=risk_threshold)
         self.reporter = ReportGenerator()
@@ -42,12 +43,14 @@ class InvestmentAssistant(Star):
 
     def _usage_add(self) -> str:
         return (
-            "用法: `/add_position <代码> <名称> <市场> <类型> <数量> <成本价> [行业] [备注]`\n"
-            "市场: A股 | 美股 | 港股 | 虚拟币 | 大宗货物\n"
-            "类型: 股票 | ETF | 虚拟币 | 商品\n"
-            "例: `/add_position 600519 贵州茅台 A股 股票 100 1800 白酒`\n"
-            "例: `/add_position BTC 比特币 虚拟币 虚拟币 0.5 65000`\n"
-            "例: `/add_position GC=F 黄金 大宗货物 商品 10 2350 贵金属`"
+            "🔹 **智能添加** (推荐): `/add_position <代码> <成本价> <数量> [备注]`\n"
+            "　系统自动识别市场、名称、类型、行业。\n"
+            "　例: `/add_position 600519 1800 100`\n"
+            "　例: `/add_position AAPL 180 50`\n"
+            "　例: `/add_position BTC 65000 0.5`\n\n"
+            "🔹 **手动添加** (全参数): `/add_position <代码> <名称> <市场> <类型> <数量> <成本价> [行业] [备注]`\n"
+            "　市场: A股 | 美股 | 港股 | 虚拟币 | 大宗货物\n"
+            "　类型: 股票 | ETF | 虚拟币 | 商品"
         )
 
     def _usage_edit(self) -> str:
@@ -55,50 +58,125 @@ class InvestmentAssistant(Star):
 
     # ── Commands ─────────────────────────────────────────────
 
+    async def _resolve_and_add(
+        self, symbol: str, cost: float, quantity: float, notes: str = ""
+    ) -> str:
+        """Resolve an asset and add it to the portfolio. Returns a user-facing message."""
+
+        result = await self.resolver.resolve(symbol)
+
+        if not result["resolved"]:
+            return f"❌ {result['suggestion']}"
+
+        if result["ambiguity"] == "high":
+            lines = [result["suggestion"]]
+            lines.append("\n💡 请使用更精确的代码重新添加，或使用手动格式:")
+            lines.append(
+                "`/add_position <代码> <名称> <市场> <类型> "
+                f"{quantity} {cost}`"
+            )
+            return "\n".join(lines)
+
+        match = result["best_match"]
+        # Try to enrich with industry for A-shares
+        if match["market"] == "A股" and not match.get("industry"):
+            try:
+                industry = await self.resolver._resolve_a_share_industry(match["symbol"])
+                if industry:
+                    match["industry"] = industry
+            except Exception:
+                pass
+
+        try:
+            pos = self.pm.add(
+                symbol=match["symbol"],
+                name=match["name"],
+                market=match["market"],
+                type_=match["type"],
+                quantity=quantity,
+                avg_cost=cost,
+                industry=match.get("industry", ""),
+                notes=notes,
+            )
+        except ValueError as e:
+            return f"❌ 添加失败: {e}"
+
+        industry_str = f" · {pos['industry']}" if pos["industry"] else ""
+        return (
+            f"✅ 已智能添加持仓:\n"
+            f"ID: `{pos['id']}`\n"
+            f"代码: {pos['symbol']} | 名称: {pos['name']}\n"
+            f"市场: {pos['market']} | 类型: {pos['type']}{industry_str}\n"
+            f"数量: {pos['quantity']} | 成本价: {pos['avg_cost']}\n"
+            f"识别来源: {match.get('source', 'unknown')}"
+        )
+
     @filter.command("add_position")
     async def cmd_add_position(self, event: AstrMessageEvent) -> MessageEventResult:
-        """添加投资持仓到组合"""
+        """智能添加投资持仓——只需代码+成本+数量，自动识别市场和行业"""
         text = event.message_str.strip()
-        parts = text.split()
-        if len(parts) < 7:
+        cmd = text.split()[0]
+        args = text[len(cmd):].strip().split()
+        if len(args) < 3:
             yield event.plain_result(self._usage_add())
             return
 
-        cmd = parts[0]
-        args = text[len(cmd):].strip().split()
-        if len(args) < 6:
-            yield event.plain_result(f"参数不足。{self._usage_add()}")
-            return
-
-        symbol = args[0]
-        name = args[1]
-        market = args[2]
-        type_ = args[3]
+        # Detect format: new (symbol cost quantity) vs old (symbol name market type quantity cost ...)
+        # If args[1] looks like a number, it's the new smart format
         try:
-            quantity = float(args[4])
-            avg_cost = float(args[5])
+            float(args[1])
+            is_smart = True
         except ValueError:
-            yield event.plain_result("数量和成本价必须是数字。")
+            is_smart = False
+
+        if is_smart and len(args) < 3:
+            yield event.plain_result(self._usage_add())
             return
 
-        industry = args[6] if len(args) > 6 else ""
-        notes = " ".join(args[7:]) if len(args) > 7 else ""
+        if is_smart:
+            symbol = args[0]
+            try:
+                cost = float(args[1])
+                quantity = float(args[2])
+            except ValueError:
+                yield event.plain_result("成本价和数量必须是数字。")
+                return
+            notes = " ".join(args[3:]) if len(args) > 3 else ""
 
-        try:
-            pos = self.pm.add(symbol, name, market, type_, quantity, avg_cost, industry, notes)
-        except ValueError as e:
-            yield event.plain_result(f"添加失败: {e}")
-            return
-
-        yield event.plain_result(
-            f"✅ 已添加持仓:\n"
-            f"ID: {pos['id']}\n"
-            f"代码: {pos['symbol']}\n"
-            f"名称: {pos['name']}\n"
-            f"市场: {pos['market']} | 类型: {pos['type']}\n"
-            f"数量: {pos['quantity']} | 成本: {pos['avg_cost']}\n"
-            f"行业: {pos['industry'] or '未设置'}"
-        )
+            yield event.plain_result(f"🔍 正在识别「{symbol}」...")
+            msg = await self._resolve_and_add(symbol, cost, quantity, notes)
+            yield event.plain_result(msg)
+        else:
+            # Full manual format (backward compatible)
+            if len(args) < 6:
+                yield event.plain_result(f"参数不足。\n{self._usage_add()}")
+                return
+            symbol = args[0]
+            name = args[1]
+            market = args[2]
+            type_ = args[3]
+            try:
+                quantity = float(args[4])
+                avg_cost = float(args[5])
+            except ValueError:
+                yield event.plain_result("数量和成本价必须是数字。")
+                return
+            industry = args[6] if len(args) > 6 else ""
+            notes = " ".join(args[7:]) if len(args) > 7 else ""
+            try:
+                pos = self.pm.add(symbol, name, market, type_, quantity, avg_cost, industry, notes)
+            except ValueError as e:
+                yield event.plain_result(f"添加失败: {e}")
+                return
+            yield event.plain_result(
+                f"✅ 已添加持仓:\n"
+                f"ID: {pos['id']}\n"
+                f"代码: {pos['symbol']}\n"
+                f"名称: {pos['name']}\n"
+                f"市场: {pos['market']} | 类型: {pos['type']}\n"
+                f"数量: {pos['quantity']} | 成本: {pos['avg_cost']}\n"
+                f"行业: {pos['industry'] or '未设置'}"
+            )
 
     @filter.command("del_position")
     async def cmd_del_position(self, event: AstrMessageEvent) -> MessageEventResult:
@@ -367,6 +445,20 @@ class InvestmentAssistant(Star):
             lines.append(f"{i}. {n['title']}" + (f" ({time_str})" if time_str else ""))
 
         return "\n".join(lines)
+
+    @filter.llm_tool(name="smart_add_position")
+    async def tool_smart_add_position(
+        self, event: AstrMessageEvent, symbol_or_name: str, cost: float, quantity: float
+    ) -> str:
+        """智能添加投资持仓。只需提供代码/名称、成本价和数量，系统会自动识别市场、类型、行业。
+        如果代码有歧义（如匹配到多个市场），会列出所有可能选项让用户选择。
+        Args:
+            symbol_or_name(string): 投资品代码或名称，如"600519"、"茅台"、"AAPL"、"bitcoin"、"黄金"
+            cost(number): 持仓成本价（每股/每份的买入均价）
+            quantity(number): 持仓数量（股数/份额）
+        """
+        msg = await self._resolve_and_add(str(symbol_or_name), float(cost), float(quantity))
+        return msg
 
     # ── Cron ─────────────────────────────────────────────────
 
