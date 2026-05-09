@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain, MessageEventResult
@@ -11,6 +12,10 @@ from .portfolio_manager import PortfolioManager
 from .market_data import AssetResolver, MarketDataProvider
 from .analysis import PortfolioAnalyzer
 from .report_generator import ReportGenerator
+from .alert_manager import AlertManager
+from .nav_tracker import NavTracker
+from .trade_logger import TradeLogger
+from .watchlist_manager import WatchlistManager
 
 
 class InvestmentAssistant(Star):
@@ -27,6 +32,10 @@ class InvestmentAssistant(Star):
         risk_threshold = float(config.get("risk_warning_threshold", 30.0))
         self.analyzer = PortfolioAnalyzer(risk_threshold=risk_threshold)
         self.reporter = ReportGenerator()
+        self.alert_mgr = AlertManager(data_dir)
+        self.nav_tracker = NavTracker(data_dir)
+        self.trade_logger = TradeLogger(data_dir)
+        self.watchlist = WatchlistManager(data_dir)
 
     async def initialize(self) -> None:
         await self._setup_cron_jobs()
@@ -56,7 +65,44 @@ class InvestmentAssistant(Star):
     def _usage_edit(self) -> str:
         return "用法: `/edit_position <ID> <字段> <值>`\n字段: name | quantity | avg_cost | industry | notes"
 
-    # ── Commands ─────────────────────────────────────────────
+    def _usage_alert(self) -> str:
+        return (
+            "🔔 **价格预警**:\n"
+            "`/alert add <代码> <名称> <市场> <条件> <目标值> [备注]` — 添加预警\n"
+            "`/alert list` — 查看所有预警\n"
+            "`/alert del <ID>` — 删除预警\n\n"
+            "条件: `>` 高于 | `<` 低于 | `>=` 达到 | `<=` 跌破 | `+%` 涨幅超 | `-%` 跌幅超\n"
+            "例: `/alert add 600519 贵州茅台 A股 > 2000 突破2000提醒`\n"
+            "例: `/alert add AAPL Apple 美股 -% 180 跌破180提醒`"
+        )
+
+    def _usage_watch(self) -> str:
+        return (
+            "⭐ **自选股**:\n"
+            "`/watch add <代码> <名称> <市场> [备注]` — 添加自选\n"
+            "`/watch list` — 查看自选列表\n"
+            "`/watch del <ID>` — 删除自选\n"
+            "例: `/watch add TSLA 特斯拉 美股 关注电动车`"
+        )
+
+    def _usage_trade(self) -> str:
+        return (
+            "📒 **交易记录**:\n"
+            "`/trade buy <代码> <名称> <市场> <价格> <数量> [日期] [备注]` — 记录买入\n"
+            "`/trade sell <代码> <名称> <市场> <价格> <数量> [日期] [备注]` — 记录卖出\n"
+            "`/trade log [条数]` — 查看最近交易 (默认100条)\n"
+            "`/trade summary` — 交易汇总 (已实现盈亏)\n"
+            "例: `/trade buy AAPL Apple 美股 195 50 2025-01-15 建仓`\n"
+            "例: `/trade sell AAPL Apple 美股 210 30 2025-03-20 止盈`"
+        )
+
+    def _usage_nav(self) -> str:
+        return (
+            "📈 **净值追踪**:\n"
+            "`/nav` — 查看最新净值快照\n"
+            "`/nav history [天数]` — 查看净值历史曲线 (默认30天)\n"
+            "例: `/nav history 7`"
+        )
 
     async def _resolve_and_add(
         self, symbol: str, cost: float, quantity: float, notes: str = ""
@@ -110,6 +156,8 @@ class InvestmentAssistant(Star):
             f"数量: {pos['quantity']} | 成本价: {pos['avg_cost']}\n"
             f"识别来源: {match.get('source', 'unknown')}"
         )
+
+    # ── Commands ─────────────────────────────────────────────
 
     @filter.command("add_position")
     async def cmd_add_position(self, event: AstrMessageEvent) -> MessageEventResult:
@@ -346,7 +394,6 @@ class InvestmentAssistant(Star):
         if report_type == "daily":
             report = self.reporter.daily_report(positions, analysis, indices)
         elif report_type == "weekly" or report_type == "周报":
-            from datetime import timedelta
             end = datetime.now()
             start = end - timedelta(days=7)
             report = self.reporter.weekly_report(analysis, start.strftime("%m-%d"), end.strftime("%m-%d"))
@@ -356,6 +403,387 @@ class InvestmentAssistant(Star):
             report = self.reporter.daily_report(positions, analysis, indices)
 
         yield event.plain_result(report)
+
+    # ── Price Alerts ─────────────────────────────────────────
+
+    @filter.command("alert")
+    async def cmd_alert(self, event: AstrMessageEvent) -> MessageEventResult:
+        """价格预警管理"""
+        text = event.message_str.strip()
+        cmd = text.split()[0]
+        args = text[len(cmd):].strip().split()
+
+        if not args:
+            yield event.plain_result(self._usage_alert())
+            return
+
+        sub = args[0].lower()
+
+        if sub == "add":
+            if len(args) < 6:
+                yield event.plain_result(self._usage_alert())
+                return
+            symbol = args[1]
+            name = args[2]
+            market = args[3]
+            condition = args[4]
+            try:
+                target_value = float(args[5])
+            except ValueError:
+                yield event.plain_result("目标值必须是数字。")
+                return
+            notes = " ".join(args[6:]) if len(args) > 6 else ""
+            try:
+                alert = self.alert_mgr.add(symbol, name, market, condition, target_value, notes)
+            except ValueError as e:
+                yield event.plain_result(f"添加预警失败: {e}")
+                return
+            yield event.plain_result(
+                f"🔔 已添加价格预警:\n"
+                f"ID: `{alert['id']}`\n"
+                f"标的: {alert['name']}({alert['symbol']}) · {alert['market']}\n"
+                f"条件: {alert['condition']} {alert['target_value']}\n"
+                f"状态: {'已触发' if alert['triggered'] else '监控中'}"
+            )
+
+        elif sub == "list":
+            alerts = self.alert_mgr.list_all()
+            if not alerts:
+                yield event.plain_result("📭 暂无价格预警。")
+                return
+            lines = ["## 🔔 价格预警列表", ""]
+            for a in alerts:
+                status = "🔴 已触发" if a["triggered"] else "🟢 监控中"
+                triggered = f" (触发于 {a['triggered_at']})" if a.get("triggered_at") else ""
+                lines.append(
+                    f"- `{a['id']}` {status}{triggered}\n"
+                    f"  {a['name']}({a['symbol']}) · {a['market']} | "
+                    f"{a['condition']} {a['target_value']}"
+                )
+                if a.get("notes"):
+                    lines.append(f"  备注: {a['notes']}")
+            yield event.plain_result("\n".join(lines))
+
+        elif sub == "del" or sub == "delete":
+            if len(args) < 2:
+                yield event.plain_result("用法: `/alert del <ID>`")
+                return
+            removed = self.alert_mgr.remove(args[1])
+            if removed:
+                yield event.plain_result(f"✅ 已删除预警: {removed['name']}({removed['symbol']})")
+            else:
+                yield event.plain_result(f"❌ 未找到预警 ID: {args[1]}")
+
+        else:
+            yield event.plain_result(self._usage_alert())
+
+    # ── Benchmark Comparison ──────────────────────────────────
+
+    @filter.command("benchmark")
+    async def cmd_benchmark(self, event: AstrMessageEvent) -> MessageEventResult:
+        """投资组合 vs 基准指数对比"""
+        positions = self.pm.list_all()
+        if not positions:
+            yield event.plain_result("📭 组合为空，无法进行基准对比。")
+            return
+
+        yield event.plain_result("⏳ 正在计算基准对比...")
+
+        enriched = await self.mdp.get_batch(positions)
+        analysis = self.analyzer.analyze(enriched)
+        indices = await self.mdp.get_indices()
+
+        lines = ["## 📊 基准对比分析", ""]
+
+        # Portfolio performance
+        total_pnl = analysis.get("total_pnl", 0)
+        total_pnl_pct = analysis.get("total_pnl_pct", 0)
+        total_value = analysis.get("total_value", 0)
+        arrow = "📈" if total_pnl >= 0 else "📉"
+
+        lines += [
+            "### 💼 我的组合",
+            f"总市值: {total_value:,.2f}",
+            f"总盈亏: {arrow} {total_pnl:,.2f} ({total_pnl_pct:+.2f}%)",
+            "",
+            "### 🌏 基准指数对比",
+            "",
+            "| 指数 | 现价 | 涨跌 | 对比组合 |",
+            "|------|------|------|----------|",
+        ]
+
+        for idx in indices[:6]:
+            idx_pct = idx.get("change_pct", 0)
+            delta = total_pnl_pct - idx_pct
+            beat = "✅ 跑赢" if delta > 0 else ("🔴 跑输" if delta < 0 else "➖ 持平")
+            idx_sign = "+" if idx_pct >= 0 else ""
+            lines.append(
+                f"| {idx['name']} | {idx['price']:.2f} | {idx_sign}{idx_pct:.2f}% | "
+                f"{beat} ({delta:+.2f}%) |"
+            )
+
+        # NAV trend summary if available
+        nav_summary = self.nav_tracker.summary()
+        if nav_summary.get("period_start"):
+            lines += [
+                "",
+                "### 📈 净值变化趋势",
+                f"周期: {nav_summary['period_start']} ~ {nav_summary['period_end']}",
+                f"起始净值: {nav_summary['start_value']:,.2f}",
+                f"当前净值: {nav_summary['end_value']:,.2f}",
+                f"变化: {nav_summary['change']:+,.2f} ({nav_summary['change_pct']:+.2f}%)",
+                f"最高: {nav_summary['high']:,.2f} | 最低: {nav_summary['low']:,.2f}",
+                f"趋势: {'📈 上升' if nav_summary.get('trend') == 'up' else ('📉 下降' if nav_summary.get('trend') == 'down' else '➖ 持平')}",
+            ]
+
+        yield event.plain_result("\n".join(lines))
+
+    # ── Watchlist ─────────────────────────────────────────────
+
+    @filter.command("watch")
+    async def cmd_watch(self, event: AstrMessageEvent) -> MessageEventResult:
+        """自选股管理"""
+        text = event.message_str.strip()
+        cmd = text.split()[0]
+        args = text[len(cmd):].strip().split()
+
+        if not args:
+            yield event.plain_result(self._usage_watch())
+            return
+
+        sub = args[0].lower()
+
+        if sub == "add":
+            if len(args) < 4:
+                yield event.plain_result(self._usage_watch())
+                return
+            symbol = args[1]
+            name = args[2]
+            market = args[3]
+            notes = " ".join(args[4:]) if len(args) > 4 else ""
+            try:
+                item = self.watchlist.add(symbol, name, market, notes)
+            except ValueError as e:
+                yield event.plain_result(f"添加自选失败: {e}")
+                return
+            yield event.plain_result(
+                f"⭐ 已添加到自选:\n"
+                f"ID: `{item['id']}`\n"
+                f"代码: {item['symbol']} | 名称: {item['name']}\n"
+                f"市场: {item['market']}"
+            )
+
+        elif sub == "list":
+            items = self.watchlist.list_all()
+            if not items:
+                yield event.plain_result("📭 自选列表为空。")
+                return
+
+            yield event.plain_result("⏳ 正在获取自选行情...")
+
+            lines = ["## ⭐ 自选股行情", "", "| 名称 | 代码 | 市场 | 现价 | 涨跌 |", "|------|------|------|------|------|"]
+            for it in items:
+                quote = await self.mdp.get_quote(it["symbol"], it["market"])
+                if quote:
+                    cp = quote.get("price", 0)
+                    chg = quote.get("change_pct", 0)
+                    chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+                    lines.append(f"| {it['name']} | {it['symbol']} | {it['market']} | {cp:.2f} | {chg_str} |")
+                else:
+                    lines.append(f"| {it['name']} | {it['symbol']} | {it['market']} | N/A | N/A |")
+
+            yield event.plain_result("\n".join(lines))
+
+        elif sub == "del" or sub == "delete":
+            if len(args) < 2:
+                yield event.plain_result("用法: `/watch del <ID>`")
+                return
+            removed = self.watchlist.remove(args[1])
+            if removed:
+                yield event.plain_result(f"✅ 已从自选移除: {removed['name']}({removed['symbol']})")
+            else:
+                yield event.plain_result(f"❌ 未找到自选 ID: {args[1]}")
+
+        else:
+            yield event.plain_result(self._usage_watch())
+
+    # ── NAV Curve ─────────────────────────────────────────────
+
+    @filter.command("nav")
+    async def cmd_nav(self, event: AstrMessageEvent) -> MessageEventResult:
+        """净值追踪"""
+        text = event.message_str.strip()
+        parts = text.split()
+
+        if len(parts) > 1 and parts[1].lower() in ("history", "历史"):
+            days = 30
+            if len(parts) > 2:
+                try:
+                    days = int(parts[2])
+                except ValueError:
+                    days = 30
+            days = min(days, 365)
+
+            history = self.nav_tracker.get_history(days)
+            if not history:
+                yield event.plain_result("📭 暂无净值历史数据。每日收盘后自动记录。")
+                return
+
+            lines = [f"## 📈 净值历史曲线 (近{days}天)", ""]
+            lines.append("| 日期 | 总净值 | 持仓数 | 指数 |")
+            lines.append("|------|--------|--------|------|")
+            for snap in history:
+                date = snap.get("date", "?")
+                tv = snap.get("total_value", 0)
+                pc = snap.get("position_count", 0)
+                idx_str = ", ".join(
+                    f"{i['name']}: {i['price']:.0f}" for i in (snap.get("indices") or [])[:2]
+                )
+                lines.append(f"| {date} | {tv:,.2f} | {pc} | {idx_str} |")
+
+            nav_summary = self.nav_tracker.summary()
+            if nav_summary.get("period_start"):
+                lines += [
+                    "",
+                    f"周期: {nav_summary['period_start']} ~ {nav_summary['period_end']}",
+                    f"变化: {nav_summary['change']:+,.2f} ({nav_summary['change_pct']:+.2f}%)",
+                    f"最高: {nav_summary['high']:,.2f} | 最低: {nav_summary['low']:,.2f}",
+                ]
+
+            yield event.plain_result("\n".join(lines))
+        else:
+            latest = self.nav_tracker.latest()
+            if not latest:
+                yield event.plain_result("📭 暂无净值快照。每日收盘后自动记录，或使用 `/nav history` 查看历史。")
+                return
+
+            lines = [
+                f"## 📈 最新净值快照",
+                f"日期: {latest['date']}",
+                f"总净值: {latest['total_value']:,.2f}",
+                f"持仓数量: {latest['position_count']}",
+                "",
+                "### 📊 持仓权重",
+            ]
+            for p in latest.get("positions", []):
+                lines.append(f"- {p['name']}({p['symbol']}): {p['market_value']:,.2f} ({p['weight']}%)")
+
+            if latest.get("indices"):
+                lines += ["", "### 🌏 同期指数"]
+                for idx in latest["indices"]:
+                    sign = "+" if idx.get("change_pct", 0) >= 0 else ""
+                    lines.append(f"- {idx['name']}: {idx['price']:.2f} ({sign}{idx['change_pct']:.2f}%)")
+
+            yield event.plain_result("\n".join(lines))
+
+    # ── Trade Log ─────────────────────────────────────────────
+
+    @filter.command("trade")
+    async def cmd_trade(self, event: AstrMessageEvent) -> MessageEventResult:
+        """交易记录管理"""
+        text = event.message_str.strip()
+        cmd = text.split()[0]
+        args = text[len(cmd):].strip().split()
+
+        if not args:
+            yield event.plain_result(self._usage_trade())
+            return
+
+        sub = args[0].lower()
+
+        if sub in ("buy", "sell"):
+            if len(args) < 6:
+                yield event.plain_result(self._usage_trade())
+                return
+            trade_type = sub
+            symbol = args[1]
+            name = args[2]
+            market = args[3]
+            try:
+                price = float(args[4])
+                quantity = float(args[5])
+            except ValueError:
+                yield event.plain_result("价格和数量必须是数字。")
+                return
+            # Optional date and notes
+            date = ""
+            notes_start = 6
+            if len(args) > 6:
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", args[6]):
+                    date = args[6]
+                    notes_start = 7
+            notes = " ".join(args[notes_start:]) if len(args) > notes_start else ""
+            try:
+                trade = self.trade_logger.record(trade_type, symbol, name, market, price, quantity, date, notes)
+            except ValueError as e:
+                yield event.plain_result(f"记录交易失败: {e}")
+                return
+            type_cn = "买入" if trade_type == "buy" else "卖出"
+            yield event.plain_result(
+                f"📒 已记录{type_cn}:\n"
+                f"ID: `{trade['id']}`\n"
+                f"标的: {trade['name']}({trade['symbol']}) · {trade['market']}\n"
+                f"价格: {trade['price']:.2f} | 数量: {trade['quantity']}\n"
+                f"金额: {trade['amount']:,.2f} | 日期: {trade['date']}"
+            )
+
+        elif sub == "log":
+            limit = 20
+            if len(args) > 1:
+                try:
+                    limit = int(args[1])
+                except ValueError:
+                    limit = 20
+            limit = min(limit, 200)
+
+            trades = self.trade_logger.list_all(limit)
+            if not trades:
+                yield event.plain_result("📭 暂无交易记录。")
+                return
+
+            lines = [f"## 📒 交易记录 (最近{min(limit, len(trades))}条)", ""]
+            lines.append("| 日期 | 类型 | 标的 | 价格 | 数量 | 金额 |")
+            lines.append("|------|------|------|------|------|------|")
+            for t in trades:
+                type_cn = "🟢 买入" if t["type"] == "buy" else "🔴 卖出"
+                lines.append(
+                    f"| {t['date']} | {type_cn} | {t['name']}({t['symbol']}) | "
+                    f"{t['price']:.2f} | {t['quantity']} | {t['amount']:,.2f} |"
+                )
+
+            yield event.plain_result("\n".join(lines))
+
+        elif sub == "summary":
+            s = self.trade_logger.summary()
+            if s["trade_count"] == 0:
+                yield event.plain_result("📭 暂无交易记录。")
+                return
+
+            lines = [
+                "## 📊 交易汇总",
+                "",
+                f"总交易笔数: {s['trade_count']}",
+                f"总买入金额: {s['total_buy_amount']:,.2f}",
+                f"总卖出金额: {s['total_sell_amount']:,.2f}",
+                f"净现金流: {s['net_cash_flow']:+,.2f}",
+                "",
+                "### 📋 各标的已实现盈亏",
+                "",
+                "| 标的 | 市场 | 买入均价 | 卖出均价 | 净持仓 | 已实现盈亏 |",
+                "|------|------|----------|----------|--------|------------|",
+            ]
+            for bs in s.get("by_symbol", []):
+                pnl_str = f"{bs['realized_pnl']:+,.2f}"
+                lines.append(
+                    f"| {bs['name']}({bs['symbol']}) | {bs.get('market', '')} | "
+                    f"{bs['avg_buy_price']:.2f} | {bs['avg_sell_price']:.2f} | "
+                    f"{bs['net_qty']} | {pnl_str} |"
+                )
+
+            yield event.plain_result("\n".join(lines))
+
+        else:
+            yield event.plain_result(self._usage_trade())
 
     # ── LLM Tools ────────────────────────────────────────────
 
@@ -460,6 +888,171 @@ class InvestmentAssistant(Star):
         msg = await self._resolve_and_add(str(symbol_or_name), float(cost), float(quantity))
         return msg
 
+    @filter.llm_tool(name="set_price_alert")
+    async def tool_set_price_alert(
+        self, event: AstrMessageEvent, symbol: str, name: str, market: str,
+        condition: str, target_value: float, notes: str = ""
+    ) -> str:
+        """设置价格预警，当标的价格满足条件时自动通知。
+        Args:
+            symbol(string): 资产代码
+            name(string): 资产名称
+            market(string): 市场类型，可选值: A股、美股、港股、虚拟币、大宗货物
+            condition(string): 触发条件，可选值: > (高于)、< (低于)、>= (达到)、<= (跌破)、+% (涨幅超)、-% (跌幅超)
+            target_value(number): 目标价格
+            notes(string): 备注
+        """
+        try:
+            alert = self.alert_mgr.add(symbol, name, market, condition, target_value, notes)
+        except ValueError as e:
+            return f"设置预警失败: {e}"
+        return (
+            f"🔔 已设置价格预警:\n"
+            f"标的: {alert['name']}({alert['symbol']}) · {alert['market']}\n"
+            f"条件: {alert['condition']} {alert['target_value']}\n"
+            f"ID: `{alert['id']}`"
+        )
+
+    @filter.llm_tool(name="get_benchmark")
+    async def tool_get_benchmark(self, event: AstrMessageEvent) -> str:
+        """获取投资组合与主要市场指数的基准对比，了解组合是否跑赢大盘。"""
+        positions = self.pm.list_all()
+        if not positions:
+            return "当前投资组合为空，无法进行基准对比。"
+
+        enriched = await self.mdp.get_batch(positions)
+        analysis = self.analyzer.analyze(enriched)
+        indices = await self.mdp.get_indices()
+
+        total_pnl_pct = analysis.get("total_pnl_pct", 0)
+        lines = [
+            f"## 📊 基准对比",
+            f"组合收益: {total_pnl_pct:+.2f}%",
+            "",
+            "| 指数 | 涨跌 | 对比 |",
+            "|------|------|------|",
+        ]
+        for idx in indices[:6]:
+            idx_pct = idx.get("change_pct", 0)
+            delta = total_pnl_pct - idx_pct
+            beat = "✅ 跑赢" if delta > 0 else ("🔴 跑输" if delta < 0 else "➖ 持平")
+            lines.append(f"| {idx['name']} | {idx_pct:+.2f}% | {beat} ({delta:+.2f}%) |")
+
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="manage_watchlist")
+    async def tool_manage_watchlist(
+        self, event: AstrMessageEvent, action: str, symbol: str = "",
+        name: str = "", market: str = "", notes: str = ""
+    ) -> str:
+        """管理自选股列表，添加/查看/删除关注标的。
+        Args:
+            action(string): 操作类型，可选值: add(添加)、list(查看)、remove(删除)
+            symbol(string): 资产代码 (add/remove 时必填)
+            name(string): 资产名称 (add 时必填)
+            market(string): 市场类型 (add 时必填)
+            notes(string): 备注 (add 时可选)
+        """
+        if action == "add":
+            if not symbol or not name or not market:
+                return "添加自选需要提供 symbol、name、market 参数。"
+            try:
+                item = self.watchlist.add(symbol, name, market, notes)
+            except ValueError as e:
+                return f"添加自选失败: {e}"
+            return f"⭐ 已添加自选: {item['name']}({item['symbol']}) · {item['market']} (ID: `{item['id']}`)"
+
+        elif action == "list":
+            items = self.watchlist.list_all()
+            if not items:
+                return "自选列表为空。"
+            lines = ["## ⭐ 自选列表"]
+            for it in items:
+                quote = await self.mdp.get_quote(it["symbol"], it["market"])
+                if quote:
+                    chg = quote.get("change_pct", 0)
+                    chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+                    lines.append(f"- {it['name']}({it['symbol']}) · {it['market']} | {quote['price']:.2f} | {chg_str}")
+                else:
+                    lines.append(f"- {it['name']}({it['symbol']}) · {it['market']}")
+            return "\n".join(lines)
+
+        elif action == "remove":
+            if not symbol:
+                return "删除自选需要提供 symbol (自选ID)。"
+            removed = self.watchlist.remove(symbol)
+            if removed:
+                return f"✅ 已从自选移除: {removed['name']}({removed['symbol']})"
+            return f"❌ 未找到自选 ID: {symbol}"
+
+        return f"不支持的操作: {action}。可选: add / list / remove"
+
+    # ── Alert Checker ────────────────────────────────────────
+
+    async def _check_alerts(self) -> None:
+        """Check all active alerts against current prices and notify if triggered."""
+        active = self.alert_mgr.list_active()
+        if not active:
+            return
+
+        target_session = self.config.get("target_session", "")
+        if not target_session:
+            return
+
+        triggered_any = []
+        for alert in active:
+            try:
+                quote = await self.mdp.get_quote(alert["symbol"], alert["market"])
+                if not quote:
+                    continue
+                current_price = quote.get("price", 0)
+                if current_price <= 0:
+                    continue
+
+                if self.alert_mgr.check_condition(alert, current_price):
+                    self.alert_mgr.mark_triggered(alert["id"])
+                    triggered_any.append((alert, current_price))
+            except Exception:
+                continue
+
+        if triggered_any:
+            lines = ["🔔 **价格预警触发**\n"]
+            for alert, price in triggered_any:
+                lines.append(
+                    f"- {alert['name']}({alert['symbol']}) "
+                    f"现价 {price:.2f} 触发条件: {alert['condition']} {alert['target_value']}"
+                )
+            chain = MessageChain().message("\n".join(lines))
+            await self.context.send_message(target_session, chain)
+
+    async def _take_nav_snapshot(self) -> None:
+        """Take a daily NAV snapshot for the portfolio."""
+        positions = self.pm.list_all()
+        if not positions:
+            return
+
+        enriched = await self.mdp.get_batch(positions)
+        analysis = self.analyzer.analyze(enriched)
+        indices = await self.mdp.get_indices()
+
+        total_value = analysis.get("total_value", 0)
+        if total_value <= 0:
+            return
+
+        self.nav_tracker.snapshot(
+            total_value=total_value,
+            positions=[
+                {
+                    "symbol": p.get("symbol", ""),
+                    "name": p.get("name", ""),
+                    "market_value": p.get("market_value") or 0,
+                }
+                for p in enriched
+            ],
+            indices=indices,
+        )
+        logger.info(f"NAV snapshot taken: {total_value:,.2f}")
+
     # ── Cron ─────────────────────────────────────────────────
 
     async def _setup_cron_jobs(self) -> None:
@@ -517,7 +1110,29 @@ class InvestmentAssistant(Star):
                 persistent=False,
             )
 
-            logger.info("投资助手定时任务已注册")
+            # Alert check every 5 minutes
+            await cron.add_basic_job(
+                name="investment_alert_check",
+                cron_expression="*/5 * * * *",
+                handler=self._check_alerts,
+                description="投资助手价格预警检查 (每5分钟)",
+                timezone="Asia/Shanghai",
+                enabled=True,
+                persistent=False,
+            )
+
+            # NAV snapshot daily at 15:05 (after A-share close)
+            await cron.add_basic_job(
+                name="investment_nav_snapshot",
+                cron_expression="5 15 * * 1-5",
+                handler=self._take_nav_snapshot,
+                description="投资助手每日净值快照",
+                timezone="Asia/Shanghai",
+                enabled=True,
+                persistent=False,
+            )
+
+            logger.info("投资助手定时任务已注册 (含预警检查 + NAV快照)")
 
     async def _send_daily_report_to_session(self) -> None:
         target = self.config.get("target_session", "")
@@ -542,7 +1157,6 @@ class InvestmentAssistant(Star):
             return
         enriched = await self.mdp.get_batch(positions)
         analysis = self.analyzer.analyze(enriched)
-        from datetime import timedelta
         end = datetime.now()
         start = end - timedelta(days=7)
         report = self.reporter.weekly_report(analysis, start.strftime("%m-%d"), end.strftime("%m-%d"))

@@ -1,6 +1,6 @@
 name: astrbot_plugin_investment_assistant
 display_name: 投资助手
-desc: 构建个人投资组合(A股/美股/港股/虚拟币/大宗货物)，提供组合分析、风险评估与自然语言盯盘报告。
-version: v0.1.0
+desc: 一站式投资组合管理，含持仓管理/智能识别/行情盯盘/组合分析/风险评估/价格预警/基准对比/自选股/净值追踪/交易记录/LLM自然语言交互
+version: v0.2.0
 author: Qing-Zhe-DotCom
 repo: https://github.com/Qing-Zhe-DotCom/astrbot_plugin_investment_assistant.git
