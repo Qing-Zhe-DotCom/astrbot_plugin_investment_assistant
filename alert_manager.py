@@ -93,7 +93,7 @@ class AlertManager:
         elif cond == "<=":
             return current_price <= target
         elif cond == "+%":
-            return current_price >= target * 1.01  # trigger when price >= target * 1.01 means target reached within 1%
+            return current_price >= target
         elif cond == "-%":
-            return current_price <= target * 0.99
+            return current_price <= target
         return False

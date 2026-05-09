@@ -90,7 +90,7 @@ class InvestmentAssistant(Star):
             "📒 **交易记录**:\n"
             "`/trade buy <代码> <名称> <市场> <价格> <数量> [日期] [备注]` — 记录买入\n"
             "`/trade sell <代码> <名称> <市场> <价格> <数量> [日期] [备注]` — 记录卖出\n"
-            "`/trade log [条数]` — 查看最近交易 (默认100条)\n"
+            "`/trade log [条数]` — 查看最近交易 (默认20条)\n"
             "`/trade summary` — 交易汇总 (已实现盈亏)\n"
             "例: `/trade buy AAPL Apple 美股 195 50 2025-01-15 建仓`\n"
             "例: `/trade sell AAPL Apple 美股 210 30 2025-03-20 止盈`"
@@ -1110,7 +1110,22 @@ class InvestmentAssistant(Star):
                 persistent=False,
             )
 
-            # Alert check every 5 minutes
+            logger.info("投资助手定时报告已注册")
+
+        # NAV snapshot daily at 15:05 (after A-share close) — independent of auto_watch
+        await cron.add_basic_job(
+            name="investment_nav_snapshot",
+            cron_expression="5 15 * * 1-5",
+            handler=self._take_nav_snapshot,
+            description="投资助手每日净值快照",
+            timezone="Asia/Shanghai",
+            enabled=True,
+            persistent=False,
+        )
+
+        # Alert check every 5 minutes — needs target_session to notify
+        target_session = self.config.get("target_session", "")
+        if target_session:
             await cron.add_basic_job(
                 name="investment_alert_check",
                 cron_expression="*/5 * * * *",
@@ -1121,18 +1136,7 @@ class InvestmentAssistant(Star):
                 persistent=False,
             )
 
-            # NAV snapshot daily at 15:05 (after A-share close)
-            await cron.add_basic_job(
-                name="investment_nav_snapshot",
-                cron_expression="5 15 * * 1-5",
-                handler=self._take_nav_snapshot,
-                description="投资助手每日净值快照",
-                timezone="Asia/Shanghai",
-                enabled=True,
-                persistent=False,
-            )
-
-            logger.info("投资助手定时任务已注册 (含预警检查 + NAV快照)")
+        logger.info("投资助手定时任务已注册 (NAV快照 + 预警检查)")
 
     async def _send_daily_report_to_session(self) -> None:
         target = self.config.get("target_session", "")
