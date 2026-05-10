@@ -427,21 +427,40 @@ class AssetResolver:
             })
             return results
 
-        # Fuzzy name match
-        name_mask = name_series.str.contains(q, na=False)
+        # Exact name match (more reliable than str.contains for Chinese)
+        exact_mask = name_series == q
+        if exact_mask.any():
+            for _, r in df[exact_mask].head(8).iterrows():
+                code = str(r["代码"]).strip()
+                results.append({
+                    "symbol": code,
+                    "name": str(r["名称"]).strip(),
+                    "market": "A股",
+                    "type": self._a_share_type(code),
+                    "industry": "",
+                    "confidence": 1.0,
+                    "source": "a_share_name_exact",
+                })
+            results.sort(key=lambda x: x["confidence"], reverse=True)
+            return results[:5]
+
+        # Fuzzy name match (regex=False for literal substring matching)
+        try:
+            name_mask = name_series.str.contains(q, na=False, regex=False)
+        except Exception:
+            name_mask = name_series.str.contains(q, na=False)
         if name_mask.any():
             matched = df[name_mask]
             for _, r in matched.head(8).iterrows():
                 code = str(r["代码"]).strip()
                 name_val = str(r["名称"]).strip()
-                exact = name_val == q
                 results.append({
                     "symbol": code,
                     "name": name_val,
                     "market": "A股",
                     "type": self._a_share_type(code),
                     "industry": "",
-                    "confidence": 0.95 if exact else 0.7,
+                    "confidence": 0.7,
                     "source": "a_share_name",
                 })
 
@@ -521,8 +540,15 @@ class AssetResolver:
             logger.warning(f"HK resolution query failed: {e}")
             return []
 
-        q = str(query).strip().zfill(5)
-        code_rows = df[df["代码"] == q]
+        q = str(query).strip()
+
+        # Normalise columns
+        code_series = df["代码"].astype(str).str.strip()
+        name_series = df["名称"].astype(str).str.strip()
+
+        # Exact code match
+        code_key = q.zfill(5)
+        code_rows = df[code_series == code_key]
         if not code_rows.empty:
             r = code_rows.iloc[0]
             code = str(r["代码"])
@@ -535,6 +561,44 @@ class AssetResolver:
                 "confidence": 1.0,
                 "source": "hk_code",
             }]
+
+        # Exact name match
+        exact_mask = name_series == q
+        if exact_mask.any():
+            results = []
+            for _, r in df[exact_mask].head(8).iterrows():
+                code = str(r["代码"]).strip()
+                results.append({
+                    "symbol": code,
+                    "name": str(r["名称"]).strip(),
+                    "market": "港股",
+                    "type": self._hk_type(code),
+                    "industry": "",
+                    "confidence": 1.0,
+                    "source": "hk_name_exact",
+                })
+            return results[:5]
+
+        # Fuzzy name match
+        try:
+            name_mask = name_series.str.contains(q, na=False, regex=False)
+        except Exception:
+            name_mask = name_series.str.contains(q, na=False)
+        if name_mask.any():
+            results = []
+            for _, r in df[name_mask].head(8).iterrows():
+                code = str(r["代码"]).strip()
+                results.append({
+                    "symbol": code,
+                    "name": str(r["名称"]).strip(),
+                    "market": "港股",
+                    "type": self._hk_type(code),
+                    "industry": "",
+                    "confidence": 0.7,
+                    "source": "hk_name",
+                })
+            return results[:5]
+
         return []
 
     async def _resolve_crypto(self, query: str) -> list[dict]:
@@ -677,8 +741,9 @@ class AssetResolver:
             if len(q) <= 5:
                 all_matches.extend(await self._resolve_hk_stock(q))
         elif is_chinese:
-            # Chinese name — could be A-share or commodity by Chinese name
+            # Chinese name — could be A-share, HK stock, or commodity
             all_matches.extend(await self._resolve_a_share(q))
+            all_matches.extend(await self._resolve_hk_stock(q))
             all_matches.extend(await self._resolve_commodity(q))
         elif is_alpha:
             # Alpha — could be US stock, crypto, or commodity ticker
