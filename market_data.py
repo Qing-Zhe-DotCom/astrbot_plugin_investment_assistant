@@ -507,7 +507,9 @@ class AssetResolver:
         elif qt == "FUTURES":
             type_ = "商品"
         elif qt == "CRYPTOCURRENCY":
-            type_ = "虚拟币"
+            # CoinGecko handles crypto resolution; returning it here as "美股"
+            # with 0.95 confidence creates false ambiguity for BTC/ETH/etc.
+            return []
         else:
             type_ = "股票"
 
@@ -632,7 +634,8 @@ class AssetResolver:
             if exact_sym and exact_name:
                 confidence = 0.98
             elif exact_sym:
-                confidence = 0.93
+                # Symbol-only match: reliable for top-50 coins, likely noise otherwise
+                confidence = 0.93 if rank <= 50 else 0.55
             elif exact_name:
                 confidence = 0.90
             elif q in cid.lower() or q.lower() in cid.lower():
@@ -640,13 +643,11 @@ class AssetResolver:
             else:
                 confidence = 0.4
 
-            # Penalise deeper matches — lower-ranked coins with same symbol
-            # are less likely to be the intended target
-            if rank > 100 and not (exact_sym and exact_name):
-                confidence -= 0.15
-            # Boost confidence for top-ranked well-known coins
-            if rank <= 10:
-                confidence = min(1.0, confidence + 0.05)
+            # Small adjustments for extreme ranks
+            if rank <= 10 and not (exact_sym and exact_name):
+                confidence = min(1.0, confidence + 0.10)
+            if rank > 500 and confidence > 0.5:
+                confidence -= 0.10
 
             results.append({
                 "symbol": symbol,
@@ -785,16 +786,22 @@ class AssetResolver:
             best_rank = best.get("rank", 99999)
             second_rank = deduped[1].get("rank", 99999)
 
-            # Auto-accept if best has very high confidence AND either
-            # (a) second is much lower confidence, or
-            # (b) best is a top-50 market cap coin (well-known) with moderate gap
+            # Auto-accept when the runner-up is clearly not a credible alternative:
+            # (a) runner-up has low absolute confidence (< 0.70), or
+            # (b) confidence gap is wide enough, or
+            # (c) best is a top-50 coin with moderate gap
+            runner_up_conf = deduped[1]["confidence"]
             if best["confidence"] >= 0.95 and (
-                gap > 0.25
-                or (best_rank <= 50 and gap > 0.15)
+                runner_up_conf < 0.70
+                or gap >= 0.20
+                or (best_rank <= 50 and gap >= 0.10)
             ):
                 ambiguity = "low"
                 suggestion = f"✅ 已自动识别: {best['name']}({best['symbol']}) — {best['market']} · {best['type']}"
-            elif best["confidence"] >= 0.90 and gap > 0.4:
+            elif best["confidence"] >= 0.90 and (
+                runner_up_conf < 0.60
+                or gap >= 0.30
+            ):
                 ambiguity = "low"
                 suggestion = f"✅ 已自动识别: {best['name']}({best['symbol']}) — {best['market']} · {best['type']}"
             else:
